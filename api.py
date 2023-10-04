@@ -1,7 +1,9 @@
-from typing import List, Optional, Type
+import uuid
+from typing import List, Optional, Type, Union, Any, cast
 
 from pydantic import Field
 from pydantic.main import BaseModel
+from steamship import Block, Task
 from steamship.agents.functional import FunctionsBasedAgent
 from steamship.agents.llms.openai import ChatOpenAI
 from steamship.agents.mixins.transports.slack import (
@@ -13,8 +15,9 @@ from steamship.agents.mixins.transports.telegram import (
     TelegramTransport,
     TelegramTransportConfig,
 )
-from steamship.agents.schema import Tool
+from steamship.agents.schema import Tool, AgentContext, Agent, Action, Metadata
 from steamship.agents.service.agent_service import AgentService
+from steamship.agents.tools.base_tools import ToolInterruptedError
 from steamship.invocable import Config, post
 from steamship.utils.kv_store import KeyValueStore
 
@@ -88,18 +91,51 @@ class DynamicPromptArguments(BaseModel):
         )
 
 
+class NameTool(Tool):
+    name = "NameTool"
+    agent_description = "Used to ask the user their name"
+    human_description = "Interrupts the flow to ask the user their name, respond in the post piece"
+    # NOT is_final.  This tool should get called again with the same history.
+
+    def __init__(self, kv_store: KeyValueStore, **data):
+        super().__init__(**data)
+        self.kv_store = kv_store
+
+    def is_pending(self) -> bool:
+        val = self.kv_store.get("replace_with_user_id")
+        if not val or val.get("value") is not None:
+            return False
+        return True
+
+    def pending_context_id(self) -> Optional[str]:
+        val = self.kv_store.get("replace_with_user_id")
+        return val.get("context_id") if val else None
+
+    def pending_message(self) -> Optional[str]:
+        val = self.kv_store.get("replace_with_user_id")
+        return val.get("message") if val else None
+
+    def get_value(self) -> Optional[str]:
+        val = self.kv_store.get("replace_with_user_id")
+        if not val or not val.get("value"):
+            return None
+        return val["value"]
+
+    def set_value(self, value: str) -> None:
+        self.kv_store.set("replace_with_user_id", {"value": value})
+
+    def run(self, tool_input: List[Block], context: AgentContext) -> Union[List[Block], Task[Any]]:
+        name = self.get_value()
+        if name:
+            # We've set it
+            return [Block(text=name)]
+
+        message = f"Please confirm your name at the confirmation endpoint."
+        self.kv_store.set("replace_with_user_id", {"value": None, "message": message, "context_id": context.id})
+        raise ToolInterruptedError(self, message, context.id)
+
+
 class BasicAgentServiceWithDynamicPrompt(AgentService):
-    """Deployable Multimodal Bot using a dynamic prompt that users can change.
-
-    Comes with out of the box support for:
-    - Telegram
-    - Slack
-    - Web Embeds
-    """
-
-    USED_MIXIN_CLASSES = [SteamshipWidgetTransport, TelegramTransport, SlackTransport]
-    """USED_MIXIN_CLASSES tells Steamship what additional HTTP endpoints to register on your AgentService."""
-
     class BasicAgentServiceWithDynamicPromptConfig(Config):
         """Pydantic definition of the user-settable Configuration of this Agent."""
 
@@ -125,51 +161,19 @@ class BasicAgentServiceWithDynamicPrompt(AgentService):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-
-        # Tools Setup
-        # -----------
-
-        # Tools can return text, audio, video, and images. They can store & retrieve information from vector DBs, and
-        # they can be stateful -- using Key-Valued storage and conversation history.
-        #
-        # See https://docs.steamship.com for a full list of supported Tools.
-        self.tools = []
-
-        # Dynamic Prompt Setup
-        # ---------------------
-        #
-        # Here we load the prompt from Steamship's KeyValueStore. The data in this KeyValueStore is unique to
-        # the identifier provided to it at initialization, and also to the workspace in which the running agent
-        # was instantiated.
-        #
-        # Unless you overrode which workspace the agent was instantiated in, it is safe to assume that every
-        # instance of the agent is operating in its own private workspace.
-        #
-        # Here is where we load the stored prompt arguments. Then see below where we set agent.PROMPT with them.
-
         self.kv_store = KeyValueStore(self.client, store_identifier="my-kv-store")
+        self.name_tool = NameTool(self.kv_store)
+        self.tools = [self.name_tool]
         self.prompt_arguments = DynamicPromptArguments.parse_obj(
             self.kv_store.get("prompt-arguments") or {}
         )
-
-        # Agent Setup
-        # ---------------------
-
-        # This agent's planner is responsible for making decisions about what to do for a given input.
         agent = FunctionsBasedAgent(
             tools=self.tools,
             llm=ChatOpenAI(self.client, model_name="gpt-4"),
         )
-
-        # Here is where we override the agent's prompt to set its personality. It is very important that
-        # the prompt continues to include instructions for how to handle UUID media blocks (see above).
         agent.PROMPT = self.prompt_arguments.to_system_prompt()
         self.set_default_agent(agent)
 
-        # Communication Transport Setup
-        # -----------------------------
-
-        # Support Steamship's web client
         self.add_mixin(
             SteamshipWidgetTransport(
                 client=self.client,
@@ -177,25 +181,38 @@ class BasicAgentServiceWithDynamicPrompt(AgentService):
             )
         )
 
-        # Support Slack
-        self.add_mixin(
-            SlackTransport(
-                client=self.client,
-                config=SlackTransportConfig(),
-                agent_service=self,
-            )
-        )
+    def run_agent(self, agent: Agent, context: AgentContext):
+        def emit(msg: str) -> None:
+            for emit_func in context.emit_funcs:
+                emit_func([Block(text=msg)], {})
+        if self.name_tool.is_pending():
+            emit(self.name_tool.pending_message())
+            return [Block(text=self.name_tool.pending_message())]
+        try:
+            super().run_agent(agent, context)
+        except ToolInterruptedError as e:
+            tool = cast(NameTool, e.tool)
+            emit(tool.pending_message())
+            return [Block(text=tool.pending_message())]
 
-        # Support Telegram
-        self.add_mixin(
-            TelegramTransport(
-                client=self.client,
-                config=TelegramTransportConfig(
-                    bot_token=self.config.telegram_bot_token
-                ),
-                agent_service=self,
-            )
-        )
+    @post("/respond_to_prompt")
+    def respond_to_prompt(self, key: Optional[str], name: Optional[str]):
+        assert self.kv_store.get("waiting")
+        self.kv_store.delete("waiting")
+        prompt_value = self.kv_store.get(key)
+        assert prompt_value
+        context_id = prompt_value["context_id"]
+        self.kv_store.set(key, {"value": name})
+        context = self.build_default_context(context_id)
+        output_blocks = []
+
+        def sync_emit(blocks: List[Block], meta: Metadata):
+            nonlocal output_blocks
+            output_blocks.extend(blocks)
+
+        context.emit_funcs.append(sync_emit)
+        self.run_agent(self.agent, context)
+        return output_blocks
 
     @post("/set_prompt_arguments")
     def set_prompt_arguments(
